@@ -24,7 +24,10 @@ from threading import Thread
 # Requirements:                                                                         #
 # - thefuzz 0.20.0                                                                      #
 # - jaro-winkler 2.0.3                                                                  #
-#                                                                                       #
+#
+#
+#
+#                                                                                     #
 # Features:                                                                             #
 # - Launches a GUI for ease of use                                                      #
 # - Read a single workbook into the application                                         #
@@ -60,6 +63,7 @@ class TheSuperMatcher(tk.Tk):
         self.title("The Super Matcher")
         self.geometry('1000x750')
         self.frames = {}
+        self.minsize(width=750, height=625)
 
         for F in ({MainPage}):
             frame = F(container, self)
@@ -113,7 +117,7 @@ class Workbook:
                 sheetdata = pd.read_excel(xls, sheet_name=sheet)
                 self.tables[sheet] = Tables(sheet, i)
                 self.tables[sheet].readData(sheetdata)
-
+#
     def getSheets(self) -> list:
         return list(self.tables.keys())
 
@@ -541,6 +545,8 @@ class MainPage(tk.Frame):
         self.checkToEnableRun()
         self.chooseFileButton['state'] = 'normal'
         self.info["state"] = "disabled"
+        global matchCountText
+        matchCountText = 'File Loaded, Waiting to run'
 
     def onChooseFilePress(self):
         """
@@ -549,12 +555,13 @@ class MainPage(tk.Frame):
         Creates a seperate thread for background calculations!
         - Specifically the chooseThreadFnc thread
         """
+        global matchCountText
         self.chooseFileButton['state'] = 'disabled'
         self.excelFilePath = chooseFileHandler(tk.Label(self))
         if self.excelFilePath != '':
             self.sourcefilelabeldisp['text'] = self.excelFilePath
             self.info['state'] = 'disabled'
-
+            matchCountText = 'Loading Workbook, please wait...'
             print(f'Reading Workbook \'{self.excelFilePath}\'')
 
             creatingWorkbookThread = Thread(target=self.chooseThreadFnc, name='ChooseThread', daemon=True)
@@ -596,9 +603,25 @@ class MainPage(tk.Frame):
         """
         Changes run button state by checking if all required info has been entered to enable program to run
         """
+        allSelected = False
+
+        for key in self.sd_listBox:
+            for i in range(len(self.sd_listBox[key])):
+                if type(self.sd_listBox[key][i]) == tk.Listbox:
+                    if self.sd_listBox[key][i].curselection():
+                        allSelected = True
+                    else:
+                        allSelected = False
+
         if self.excelFilePath != '':
             if (self.sheetselectorbox_1.get() != self.sheetselectorbox_2.get()) and (self.colselectorbox_1.get() != '' or self.colselectorbox_2.get() != ''):
-                self.runButton['state'] = 'normal'
+                if self.doSmartMatch.get():
+                    if allSelected:
+                        self.runButton['state'] = 'normal'
+                    else:
+                        self.runButton['state'] = 'disabled'
+                else:
+                    self.runButton['state'] = 'normal'
             else:
                 self.runButton['state'] = 'disabled'
 
@@ -638,6 +661,7 @@ class MainPage(tk.Frame):
         """
         Populates the self decide widgets based on left/right table selections.
         """
+        self.checkToEnableRun()
         self.clearlistbox(self.sd_listBox)
         try: # Try to populate the listbox. If workbook object hasn't been created yet (no file loaded), pass on AttributeError
             if self.doSmartMatch.get():
@@ -796,9 +820,11 @@ class MainPage(tk.Frame):
         for key in self.sd_listBox:
             self.sd_listBox[key].append(tk.Listbox(self, width=30, height=5, selectmode="single", exportselection=0))
             self.sd_listBox[key][0].grid(column=c, row=16, rowspan=4, pady=5)
+            self.sd_listBox[key][0].bind('<<ListboxSelect>>', self.checkToEnableRun)
             self.sd_listBox[key].append(tk.Label(self, text=key, font=("Boulder", 13)))
             self.sd_listBox[key].append(tk.Listbox(self, width=30, height=5, selectmode="single", exportselection=0))
             self.sd_listBox[key][2].grid(column=c, row=21, rowspan=4, pady=5)
+            self.sd_listBox[key][2].bind('<<ListboxSelect>>', self.checkToEnableRun)
             c += 1
         c=0
         for key in self.sd_compareEmpty:
@@ -823,7 +849,10 @@ class MainPage(tk.Frame):
         self.configure(background=self.backgroundcolour)
 
         self.grid_columnconfigure(0, pad=10)
-        self.grid_columnconfigure(1, weight=3)
+        self.grid_columnconfigure(1, weight=3, minsize=280)
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(11, weight=1)
 
 
 # Run the app mainloop
