@@ -8,7 +8,7 @@ from openpyxl import load_workbook
 import pandas as pd
 import tkinter as tk
 from tkinter import ttk, messagebox
-import os
+import re
 import sys
 import time
 from threading import Thread
@@ -24,10 +24,9 @@ from threading import Thread
 # Requirements:                                                                         #
 # - thefuzz 0.20.0                                                                      #
 # - jaro-winkler 2.0.3                                                                  #
-#
-#
-#
-#                                                                                     #
+# - pandas 1.5.0                                                                        #
+# - openpyxl 3.0.10                                                                     #
+#                                                                                       #
 # Features:                                                                             #
 # - Launches a GUI for ease of use                                                      #
 # - Read a single workbook into the application                                         #
@@ -87,6 +86,7 @@ class TextRedirector(object):
         self.widget.configure(state="normal")
         self.widget.insert("end", str, (self.tag,))
         self.widget.see("end")
+        self.widget.configure(state="disabled")
 
     def flush(self):
         pass
@@ -258,7 +258,7 @@ def writeData(fluData:pd.DataFrame, excelFilePath:str, sheet_name:str, decidedTa
         print("Data Updated.\nClosing Workbook (This takes a while, too!)...\n") 
     print("Workbook Saved and Closed.\n")
 
-def runButtonHandler(Workbook: Workbook, sheet_selection:list, column_selection:list, similarity_threshold:int, matchLimit:int, doSelfDeciding:bool, selfDecideParams:dict=None) -> None:
+def runButtonHandler(Workbook: Workbook, sheet_selection:list, column_selection:list, similarity_threshold:int, matchLimit:int, doSelfDeciding:bool, matchMode:str, selfDecideParams:dict=None) -> None:
     """
     Handler function to execute main program logic
 
@@ -276,6 +276,8 @@ def runButtonHandler(Workbook: Workbook, sheet_selection:list, column_selection:
         number of matches to find
     doSelfDediciding : bool
         should run self deciding function
+    matchMode : str
+        matching scorer for fuzzy lookup
     selfDecideParams : dict
         parameter values for the self decide function
         dict {'parameter': [int, str, str, bool]}
@@ -285,19 +287,27 @@ def runButtonHandler(Workbook: Workbook, sheet_selection:list, column_selection:
     names = []
     decidedTable = pd.DataFrame()
 
+    prefix = 'FLU'
+
     for sheet in sheet_selection:
         tableData.append(Workbook.tables[sheet].getData())
         names.append(Workbook.tables[sheet].getName())
-    
-    matchedtable = fuzzyMatch(tableData, column_selection, similarity_threshold, matchLimit, Workbook)
+
+    if matchMode == "Keyword Search":
+        matchedtable = keywordMatch(tableData, column_selection)
+        prefix = 'KWS'
+    else:
+        matchedtable = fuzzyMatch(tableData, column_selection, similarity_threshold, matchLimit)
+        prefix = 'FLU'
+
     if doSelfDeciding and selfDecideParams != None:
         decidedTable = selfDecide(matchedtable, selfDecideParams)
 
-    writeData(matchedtable, Workbook.getPath(), f"FLU_{names[0]}_{names[1]}", decidedTable, f'SD_{names[0]}_{names[1]}')
-    print("Runtime Finished.\nexecution time = %s seconds" % (time.perf_counter() - start_time))
+    writeData(matchedtable, Workbook.getPath(), f"{prefix}_{names[0]}_{names[1]}", decidedTable, f'SD_{names[0]}_{names[1]}')
+    print(f"Runtime Finished.\nexecution time = {(time.perf_counter() - start_time):.1f} seconds")
 
 #original
-def fuzzyMatch(tabledata:list, column_selection:list, similarity_threshold:int, matchLimit:int, wb:Workbook) -> pd.DataFrame:
+def fuzzyMatch(tabledata:list, column_selection:list, similarity_threshold:int, matchLimit:int) -> pd.DataFrame:
     """
     Preforms the fuzzy match between two tables
 
@@ -311,8 +321,8 @@ def fuzzyMatch(tabledata:list, column_selection:list, similarity_threshold:int, 
         threshold used to decide whether to reject or keep match result
     matchLimit : int
         maximum number of matches that should be returned
-    wb : Worbook
-        the current Workbook object
+    matchMode : str
+        type of fuzzy matching scorer
 
     Returns
     ----------
@@ -325,6 +335,8 @@ def fuzzyMatch(tabledata:list, column_selection:list, similarity_threshold:int, 
 
     left_table_len = len(left_table.index)
 
+    scorer = fuzz.token_sort_ratio # Default is token_sort_ratio
+
     global matchCountText
     matchedCounter = 0
     print('Beginning Fuzzy Matching...\n')
@@ -332,7 +344,7 @@ def fuzzyMatch(tabledata:list, column_selection:list, similarity_threshold:int, 
     combinedTable = pd.DataFrame(columns=[*left_table.columns.values, *right_table.columns.values, 'Similarity Score'])
     
     for index, val in left_table.iterrows():
-        returnedValues = process.extract(val[matchOnLeft], right_table[matchOnRight], scorer=fuzz.token_sort_ratio, limit=matchLimit)
+        returnedValues = process.extract(val[matchOnLeft], right_table[matchOnRight], scorer=scorer, limit=matchLimit)
         filteredValues = []
         skippedPairs = 0
         for pair in returnedValues:
@@ -354,10 +366,55 @@ def fuzzyMatch(tabledata:list, column_selection:list, similarity_threshold:int, 
                 combinedrow['Similarity Score'] = pair[1]
                 combinedTable = combinedTable.append(combinedrow, ignore_index=True) # NOTE using pd.append() is depreciated
                 matchedCounter += 1
-                matchCountText.set(f'Row Matches Found: {matchedCounter} | Row: {index+1}/{left_table_len}')
+        matchCountText.set(f'Row Matches Found: {matchedCounter} | Row: {index+1}/{left_table_len}')
     print(f"Fuzzy Matching Complete, {matchedCounter} matches found.\n")
     return combinedTable
 
+def keywordMatch(tabledata:list, colSelection:list) -> pd.DataFrame:
+    """
+    Match keywords to substrings using regex.
+    *Does not accept any limits on matches to return - returns every match.*
+
+    Parameters
+    ----------
+    tabledata : list[pd.DataFrame, pd.DataFrame]
+        list of the two dataframes to match
+    column_selection : list[str,str]
+        list of columns to match on
+    
+    Returns
+    ----------
+    dataframe of left table with matches from right table and a similarity score (100%) column
+    """
+
+    left_table:pd.DataFrame = tabledata[0].fillna("")
+    right_table:pd.DataFrame = tabledata[1].fillna("")
+    matchOnLeft = colSelection[0]
+    matchOnRight = colSelection[1]
+
+    left_table_len = len(left_table.index)
+
+    #combinedTable = pd.DataFrame(columns=[*left_table.columns.values, *right_table.columns.values, 'Similarity Score'])
+    matchedRows = []
+
+    global matchCountText
+    matchedCounter = 0
+
+    print('Beginning Keyword Search...\n')
+
+    for index, val in left_table.iterrows():
+        regexString = r'\b{}\b'.format(re.escape(val[matchOnLeft]))
+        matches = right_table[right_table[matchOnRight].str.contains(regexString, case=False, regex=True)]
+
+        for _, matchRow in matches.iterrows():
+            combinedRow = {**val.to_dict(), **matchRow.to_dict(), 'Similarity Score': 100}
+            matchedRows.append(combinedRow)
+            matchedCounter += 1
+        matchCountText.set(f'Keyword Matches Found: {matchedCounter} | Row: {index+1}/{left_table_len}')
+    
+    combinedTable = pd.DataFrame(matchedRows)
+    print(f"Keyword Matching Complete, {matchedCounter} matches found.\n")
+    return combinedTable
 
 def selfDecide(data:pd.DataFrame,  selfDecideParams:dict) -> pd.DataFrame:
     """
@@ -402,6 +459,7 @@ def selfDecide(data:pd.DataFrame,  selfDecideParams:dict) -> pd.DataFrame:
         
         colStr = ', '.join(matchedColNames)
 
+        # TODO: Make this dynamic so that user can select 1-3 criteria instead of requiring all 3
         if numMatched == 0:
             #decisionList.append(rowString + '0/1 match')
             decisionList.append(f'0/3, Not a Match')
@@ -426,7 +484,7 @@ def selfDecide(data:pd.DataFrame,  selfDecideParams:dict) -> pd.DataFrame:
 # GUI Window
 ################################################
 
-matchCountText = None # This is a GLOBAL var that will be used to pass info from calculation threads to the GUI
+matchCountText = None # NOTE: This is a GLOBAL var that will be used to pass info from calculation threads to the GUI
 
 class MainPage(tk.Frame):
 
@@ -453,6 +511,8 @@ class MainPage(tk.Frame):
         self.selectedcol2 = tk.StringVar()
         self.doSmartMatch = tk.BooleanVar(value=False)
         self.matchCountVar = tk.StringVar()
+        self.matchingOptions = ["Match Cell Contents", "Keyword Search"]
+        self.matchingMode = tk.StringVar(value=self.matchingOptions[0])
         global matchCountText
         matchCountText = tk.StringVar()
         matchCountText.set('Waiting to run...')
@@ -464,11 +524,9 @@ class MainPage(tk.Frame):
 
         This thread is for running the background calculations for fuzzy match and self decide without freezing the GUI
         """
-        self.runButton['state'] = 'disabled'
-        self.info['state'] = 'disabled'
-        runButtonHandler(self.thisWorkbook, self.selected_tables, self.selected_columns, self.similarity_threshold, self.matchLimit, self.doSmartMatch.get(), self.compressSelfDecideParams(self.sd_slider, self.sd_listBox, self.sd_compareEmpty))
-        self.runButton['state'] = 'normal'
-        self.info['state'] = 'disabled'
+        self.button_run['state'] = 'disabled'
+        runButtonHandler(self.thisWorkbook, self.selected_tables, self.selected_columns, self.similarity_threshold, self.matchLimit, self.doSmartMatch.get(), self.matchingMode.get(), self.compressSelfDecideParams(self.sd_slider, self.sd_combobox, self.sd_compareEmpty))
+        self.button_run['state'] = 'normal'
 
     def onRunPress(self):
         """
@@ -477,12 +535,12 @@ class MainPage(tk.Frame):
         Creates a seperate thread for background calculations!
         - Specifically the matchingThreadFnc thread
         """
-        self.similarity_threshold = int(self.similarity_slider.get())
-        self.matchLimit = int(self.limit_spinbox.get())
-        self.selected_columns[0] = self.colselectorbox_1.get()
-        self.selected_columns[1] = self.colselectorbox_2.get()
-        self.selected_tables[0] = self.sheetselectorbox_1.get()
-        self.selected_tables[1] = self.sheetselectorbox_2.get()
+        self.similarity_threshold = int(self.slider_similarity.get())
+        self.matchLimit = int(self.spinbox_limit.get())
+        self.selected_columns[0] = self.combobox_col_selector_1.get()
+        self.selected_columns[1] = self.combo_col_selector_2.get()
+        self.selected_tables[0] = self.combobox_sheetselector_1.get()
+        self.selected_tables[1] = self.combobox_sheetselector_2.get()
 
         matchingThread = Thread(name='MatchingThread', daemon=True, target=self.matchingThreadFnc)
         matchingThread.start()
@@ -500,7 +558,7 @@ class MainPage(tk.Frame):
                 "Parameter 3": [int, str, str, bool]
             }
             for key in dataForDecider:
-                dataForDecider[key] = [slider[key][0].get(), listbox[key][0].get(listbox[key][0].curselection()), listbox[key][2].get(listbox[key][2].curselection()), noMatchBlank[key][0].get()]
+                dataForDecider[key] = [slider[key][0].get(), listbox[key][0].get(), listbox[key][2].get(), noMatchBlank[key][0].get()]
         else:
             dataForDecider = None
         
@@ -516,8 +574,8 @@ class MainPage(tk.Frame):
         self.sheetOptions = self.thisWorkbook.getSheets()
         
 
-        self.sheetselectorbox_1['values'] = self.sheetOptions
-        self.sheetselectorbox_2['values'] = self.sheetOptions
+        self.combobox_sheetselector_1['values'] = self.sheetOptions
+        self.combobox_sheetselector_2['values'] = self.sheetOptions
 
         self.selectedsheet1 = self.sheetOptions[0]
 
@@ -528,25 +586,26 @@ class MainPage(tk.Frame):
 
         self.sheetselectorbox_1_val = self.selectedsheet1
         self.sheetselectorbox_2_val = self.selectedsheet2
-        self.sheetselectorbox_1.set(self.selectedsheet1)
-        self.sheetselectorbox_2.set(self.selectedsheet2)
+        self.combobox_sheetselector_1.set(self.selectedsheet1)
+        self.combobox_sheetselector_2.set(self.selectedsheet2)
         
-        self.colselectorbox_1.set(self.thisWorkbook.tables[self.selectedsheet1].getHeaders()[0])
-        self.colselectorbox_2.set(self.thisWorkbook.tables[self.selectedsheet2].getHeaders()[0])
-        self.colselectorbox_1['values'] = self.thisWorkbook.tables[self.selectedsheet1].getHeaders()
-        self.colselectorbox_2['values'] = self.thisWorkbook.tables[self.selectedsheet2].getHeaders()
+        self.combobox_col_selector_1.set(self.thisWorkbook.tables[self.selectedsheet1].getHeaders()[0])
+        self.combo_col_selector_2.set(self.thisWorkbook.tables[self.selectedsheet2].getHeaders()[0])
+        self.combobox_col_selector_1['values'] = self.thisWorkbook.tables[self.selectedsheet1].getHeaders()
+        self.combo_col_selector_2['values'] = self.thisWorkbook.tables[self.selectedsheet2].getHeaders()
 
-        self.sheetselectorbox_1.bind('<<ComboboxSelected>>', self.onSheetSelect_1)
-        self.sheetselectorbox_2.bind('<<ComboboxSelected>>', self.onSheetSelect_2)
-        self.colselectorbox_1.bind('<<ComboboxSelected>>', self.checkToEnableRun)
-        self.colselectorbox_2.bind('<<ComboboxSelected>>', self.checkToEnableRun)
+        # TODO: Remove these repeat bind assignments... They're assigned in __init__, why did I do this here in the first place??
+        self.combobox_sheetselector_1.bind('<<ComboboxSelected>>', self.onSheetSelect_1)
+        self.combobox_sheetselector_2.bind('<<ComboboxSelected>>', self.onSheetSelect_2)
+        self.combobox_col_selector_1.bind('<<ComboboxSelected>>', self.checkToEnableRun)
+        self.combo_col_selector_2.bind('<<ComboboxSelected>>', self.checkToEnableRun)
 
         self.popSelfDecideWidgets()
         self.checkToEnableRun()
-        self.chooseFileButton['state'] = 'normal'
+        self.button_chooseFile['state'] = 'normal'
         self.info["state"] = "disabled"
         global matchCountText
-        matchCountText = 'File Loaded, Waiting to run'
+        matchCountText.set('File Loaded, Waiting to run')
 
     def onChooseFilePress(self):
         """
@@ -556,19 +615,22 @@ class MainPage(tk.Frame):
         - Specifically the chooseThreadFnc thread
         """
         global matchCountText
-        self.chooseFileButton['state'] = 'disabled'
+        self.button_chooseFile['state'] = 'disabled'
         self.excelFilePath = chooseFileHandler(tk.Label(self))
         if self.excelFilePath != '':
-            self.sourcefilelabeldisp['text'] = self.excelFilePath
-            self.info['state'] = 'disabled'
-            matchCountText = 'Loading Workbook, please wait...'
+
+            self.text_sourcefile_disp['state'] = 'normal'
+            self.text_sourcefile_disp.delete('1.0', 'end')
+            self.text_sourcefile_disp.insert("end", self.excelFilePath)
+            self.text_sourcefile_disp['state'] = 'disabled'
+
+            matchCountText.set('Loading Workbook, please wait...')
             print(f'Reading Workbook \'{self.excelFilePath}\'')
 
             creatingWorkbookThread = Thread(target=self.chooseThreadFnc, name='ChooseThread', daemon=True)
             creatingWorkbookThread.start()
         else:
-            self.chooseFileButton['state'] = 'normal'
-        self.info['state'] = 'disabled'
+            self.button_chooseFile['state'] = 'normal'
         
 
     def onSheetSelect_1(self, event):
@@ -579,9 +641,9 @@ class MainPage(tk.Frame):
         self.sheetselectorbox_1_val = event.widget.get()
         #self.colOptions_1 = readColumns(self.excelFile, self.sheetselectorbox_1_val)
         self.colOptions_1 = self.thisWorkbook.tables[self.sheetselectorbox_1_val].getHeaders()
-        self.colselectorbox_1['values'] = self.colOptions_1
+        self.combobox_col_selector_1['values'] = self.colOptions_1
         self.selectedcol1 = self.colOptions_1[0]
-        self.colselectorbox_1.set(self.selectedcol1)
+        self.combobox_col_selector_1.set(self.selectedcol1)
         self.checkToEnableRun()
         self.popSelfDecideWidgets()
 
@@ -593,9 +655,9 @@ class MainPage(tk.Frame):
         self.sheetselectorbox_2_val = event.widget.get()
         #self.colOptions_2 = readColumns(self.excelFile, self.sheetselectorbox_2_val)
         self.colOptions_2 = self.thisWorkbook.tables[self.sheetselectorbox_2_val].getHeaders()
-        self.colselectorbox_2['values'] = self.colOptions_2
+        self.combo_col_selector_2['values'] = self.colOptions_2
         self.selectedcol2 = self.colOptions_2[0]
-        self.colselectorbox_2.set(self.selectedcol2)
+        self.combo_col_selector_2.set(self.selectedcol2)
         self.checkToEnableRun()
         self.popSelfDecideWidgets()
 
@@ -605,25 +667,25 @@ class MainPage(tk.Frame):
         """
         allSelected = False
 
-        for key in self.sd_listBox:
-            for i in range(len(self.sd_listBox[key])):
-                if type(self.sd_listBox[key][i]) == tk.Listbox:
-                    if self.sd_listBox[key][i].curselection():
+        for key in self.sd_combobox:
+            for i in range(len(self.sd_combobox[key])):
+                if type(self.sd_combobox[key][i]) == ttk.Combobox:
+                    if self.sd_combobox[key][i].get():
                         allSelected = True
                     else:
                         allSelected = False
 
         if self.excelFilePath != '':
-            if (self.sheetselectorbox_1.get() != self.sheetselectorbox_2.get()) and (self.colselectorbox_1.get() != '' or self.colselectorbox_2.get() != ''):
+            if (self.combobox_sheetselector_1.get() != self.combobox_sheetselector_2.get()) and (self.combobox_col_selector_1.get() != '' or self.combo_col_selector_2.get() != ''):
                 if self.doSmartMatch.get():
                     if allSelected:
-                        self.runButton['state'] = 'normal'
+                        self.button_run['state'] = 'normal'
                     else:
-                        self.runButton['state'] = 'disabled'
+                        self.button_run['state'] = 'disabled'
                 else:
-                    self.runButton['state'] = 'normal'
+                    self.button_run['state'] = 'normal'
             else:
-                self.runButton['state'] = 'disabled'
+                self.button_run['state'] = 'disabled'
 
     def changeWidgetCollectionState(self, obj:dict, state:str):
         """
@@ -631,26 +693,44 @@ class MainPage(tk.Frame):
         """
         for key in obj:
             for i in range(len(obj[key])):
-                if isinstance(obj[key][i], tk.Widget):
-                    obj[key][i]['state'] = state
+                if type(obj[key][i]) == ttk.Combobox:
+                        obj[key][i]['state'] = state
+                        obj[key][i].state(['readonly'])
+                elif isinstance(obj[key][i], tk.Widget):
+                        obj[key][i]['state'] = state
     
     def unlockSelfDecideWidgets(self, event=None):
         """
         Event handler that changes state of self-decide related widgets if checkbox is clicked on/off
         """
         if self.doSmartMatch.get():
-            self.changeWidgetCollectionState(self.sd_listBox, 'normal')
+            self.changeWidgetCollectionState(self.sd_combobox, 'normal')
             self.changeWidgetCollectionState(self.sd_slider, 'normal')
             self.changeWidgetCollectionState(self.sd_compareEmpty, 'normal')
             self.popSelfDecideWidgets()
         else:
-            self.changeWidgetCollectionState(self.sd_listBox, 'disabled')
+            self.changeWidgetCollectionState(self.sd_combobox, 'disabled')
             self.changeWidgetCollectionState(self.sd_slider, 'disabled')
             self.changeWidgetCollectionState(self.sd_compareEmpty, 'disabled')
+    
+    def toggleFuzzyWidgets(self, event:tk.Event):
+        mode = event.widget.get()
+        if mode == 'Keyword Search':
+            self.slider_similarity['state'] = 'disabled'
+            self.spinbox_limit['state'] = 'disabled'
+            self.label_similarity['state'] = 'disabled'
+            self.label_slider['state'] = 'disabled'
+        else:
+            self.slider_similarity['state'] = 'normal'
+            self.spinbox_limit['state'] = 'normal'
+            self.label_similarity['state'] = 'normal'
+            self.label_slider['state'] = 'normal'
 
     def clearlistbox(self, listbox):
         """
         Clears the listbox of values
+        
+        Depreciated use since converting listboxes to combobox
         """
         for key in listbox:
             for i in range(len(listbox[key])):
@@ -662,14 +742,15 @@ class MainPage(tk.Frame):
         Populates the self decide widgets based on left/right table selections.
         """
         self.checkToEnableRun()
-        self.clearlistbox(self.sd_listBox)
+        vals1 = self.combobox_col_selector_1['values']
+        vals2 = self.combo_col_selector_2['values']
         try: # Try to populate the listbox. If workbook object hasn't been created yet (no file loaded), pass on AttributeError
             if self.doSmartMatch.get():
-                for key in self.sd_listBox:
-                    for i in range(len(self.thisWorkbook.tables[self.sheetselectorbox_1_val].getHeaders())):
-                        self.sd_listBox[key][0].insert(i, self.thisWorkbook.tables[self.sheetselectorbox_1_val].getHeaders()[i])
-                    for i in range(len(self.thisWorkbook.tables[self.sheetselectorbox_2_val].getHeaders())):
-                        self.sd_listBox[key][2].insert(i, self.thisWorkbook.tables[self.sheetselectorbox_2_val].getHeaders()[i])
+                for key in self.sd_combobox:
+                    self.sd_combobox[key][0]['values'] = vals1
+                    self.sd_combobox[key][0].set(vals1[0])
+                    self.sd_combobox[key][2]['values'] = vals2
+                    self.sd_combobox[key][2].set(vals2[0])
         except AttributeError:
             pass
 
@@ -696,115 +777,122 @@ class MainPage(tk.Frame):
         # Row 1
         ################################
 
-        self.chooseFileButton = tk.Button(self, text="Choose File", font="Arial 14", command=self.onChooseFilePress, cursor='hand2')
-        self.chooseFileButton.grid(row=2, column=0)
+        self.button_chooseFile = tk.Button(self, text="Choose File", font="Arial 14", command=self.onChooseFilePress, cursor='hand2')
+        self.button_chooseFile.grid(row=2, column=0)
 
-        self.runButton = tk.Button(self, text="Start Matching", font="Arial 14", command=self.onRunPress, cursor='hand2')
-        self.runButton.grid(row=2, column=2)
-        self.runButton['state'] = 'disabled'
+        self.button_run = tk.Button(self, text="Start Matching", font="Arial 14", command=self.onRunPress, cursor='hand2')
+        self.button_run.grid(row=2, column=2)
+        self.button_run['state'] = 'disabled'
 
         ################################
         # Row 2
         ################################
         
-        self.sourcefilelabel = tk.Label(self)
-        self.sourcefilelabel.configure(background=self.backgroundcolour)
-        self.sourcefilelabel.grid(column=0, row=3,sticky="nw", padx=15, pady=5)
-        self.sourcefilelabel['text'] = 'File Path:'
+        self.label_sourcefile = tk.Label(self)
+        self.label_sourcefile.configure(background=self.backgroundcolour, font='Roboto 10 bold')
+        self.label_sourcefile.grid(column=0, row=3,sticky="ne", padx=5, pady=5)
+        self.label_sourcefile['text'] = 'File Path:'
 
-        self.sourcefilelabeldisp = tk.Label(self)
-        self.sourcefilelabeldisp.configure(background=self.backgroundcolour)
-        self.sourcefilelabeldisp.grid(column=1, row=3,sticky="nw",pady=5)
+        self.text_sourcefile_disp = tk.Text(self)
+        self.text_sourcefile_disp.configure(height=1, font='arial 10')
+        self.text_sourcefile_disp.grid(column=1, row=3,sticky="nwe",pady=5, columnspan=2, padx=15)
+        self.text_sourcefile_disp['state'] = 'disabled'
 
         ################################
         # Row 3
         ################################
 
-        self.similarity_slider = tk.Scale(self, from_=0, to=100, orient="horizontal", cursor='hand2')
-        self.similarity_slider.grid(row = 6, column=1)
-        self.similarity_slider.set(self.similarity_threshold)
+        self.slider_similarity = tk.Scale(self, from_=0, to=100, orient="horizontal", cursor='hand2')
+        self.slider_similarity.grid(row = 6, column=1)
+        self.slider_similarity.set(self.similarity_threshold)
 
-        self.limit_spinbox = tk.Spinbox(self, from_=1, to=10) #Max 10 matches allowed
-        self.limit_spinbox.grid(row=8, column=1)
+        self.spinbox_limit = tk.Spinbox(self, from_=1, to=10) #Max 10 matches allowed
+        self.spinbox_limit.grid(row=8, column=1)
 
         ################################
         # Row 4
         ################################
         
         #combo boxes
-        self.sheetselectorbox_1 = ttk.Combobox(self, textvariable=self.selectedsheet1, width=30)
-        self.sheetselectorbox_1['values'] = self.sheetOptions
-        self.sheetselectorbox_1.state(["readonly"])
-        self.sheetselectorbox_1.grid(row=6, column=0)
+        self.combobox_sheetselector_1 = ttk.Combobox(self, textvariable=self.selectedsheet1, width=30)
+        self.combobox_sheetselector_1['values'] = self.sheetOptions
+        self.combobox_sheetselector_1.state(["readonly"])
+        self.combobox_sheetselector_1.grid(row=6, column=0)
 
-        self.sheetselectorbox_2 = ttk.Combobox(self, textvariable=self.selectedsheet2, width=30)
-        self.sheetselectorbox_2['values'] = self.sheetOptions
-        self.sheetselectorbox_2.state(["readonly"])
-        self.sheetselectorbox_2.grid(row=6, column=2)
+        self.combobox_sheetselector_2 = ttk.Combobox(self, textvariable=self.selectedsheet2, width=30)
+        self.combobox_sheetselector_2['values'] = self.sheetOptions
+        self.combobox_sheetselector_2.state(["readonly"])
+        self.combobox_sheetselector_2.grid(row=6, column=2)
 
-        self.tableLLabel = tk.Label(self)
-        self.tableLLabel.configure(background=self.backgroundcolour)
-        self.tableLLabel.grid(column=0, row=5,sticky="nw", padx=15)
-        self.tableLLabel['text'] = 'Left Table'
+        self.label_L_table = tk.Label(self)
+        self.label_L_table.configure(background=self.backgroundcolour)
+        self.label_L_table.grid(column=0, row=5,sticky="nw", padx=15)
+        self.label_L_table['text'] = 'Left Table (find matches for)'
 
-        self.tableRLabel = tk.Label(self)
-        self.tableRLabel.configure(background=self.backgroundcolour)
-        self.tableRLabel.grid(column=2, row=5,sticky="nw", padx=15)
-        self.tableRLabel['text'] = 'Right Table'
+        self.label_R_table = tk.Label(self)
+        self.label_R_table.configure(background=self.backgroundcolour)
+        self.label_R_table.grid(column=2, row=5,sticky="nw", padx=15)
+        self.label_R_table['text'] = 'Right Table (find matches from)'
 
-        self.colLLabel = tk.Label(self)
-        self.colLLabel.configure(background=self.backgroundcolour)
-        self.colLLabel.grid(column=0, row=7,sticky="nw", padx=15)
-        self.colLLabel['text'] = 'Left Matching Column'
+        self.label_L_column = tk.Label(self)
+        self.label_L_column.configure(background=self.backgroundcolour)
+        self.label_L_column.grid(column=0, row=7,sticky="nw", padx=15)
+        self.label_L_column['text'] = 'Left Matching Column'
 
-        self.colRLabel = tk.Label(self)
-        self.colRLabel.configure(background=self.backgroundcolour)
-        self.colRLabel.grid(column=2, row=7,sticky="nw", padx=15)
-        self.colRLabel['text'] = 'Right Matching Column'
+        self.label_R_column = tk.Label(self)
+        self.label_R_column.configure(background=self.backgroundcolour)
+        self.label_R_column.grid(column=2, row=7,sticky="nw", padx=15)
+        self.label_R_column['text'] = 'Right Matching Column'
 
-        self.colselectorbox_1 = ttk.Combobox(self, textvariable=self.selectedcol1, width=30)
-        self.colselectorbox_1['values'] = self.colOptions_1
-        self.colselectorbox_1.state(["readonly"])
-        self.colselectorbox_1.bind('<<ComboboxSelected>>', self.checkToEnableRun)
-        self.colselectorbox_1.grid(row=8, column=0, padx=15)
+        self.combobox_col_selector_1 = ttk.Combobox(self, textvariable=self.selectedcol1, width=30)
+        self.combobox_col_selector_1['values'] = self.colOptions_1
+        self.combobox_col_selector_1.state(["readonly"])
+        self.combobox_col_selector_1.bind('<<ComboboxSelected>>', self.checkToEnableRun)
+        self.combobox_col_selector_1.grid(row=8, column=0, padx=15)
 
-        self.colselectorbox_2 = ttk.Combobox(self, textvariable=self.selectedcol2, width=30)
-        self.colselectorbox_2['values'] = self.colOptions_2
-        self.colselectorbox_2.state(["readonly"])
-        self.colselectorbox_2.bind('<<ComboboxSelected>>', self.checkToEnableRun)
-        self.colselectorbox_2.grid(row=8, column=2, padx=15)
+        self.combo_col_selector_2 = ttk.Combobox(self, textvariable=self.selectedcol2, width=30)
+        self.combo_col_selector_2['values'] = self.colOptions_2
+        self.combo_col_selector_2.state(["readonly"])
+        self.combo_col_selector_2.bind('<<ComboboxSelected>>', self.checkToEnableRun)
+        self.combo_col_selector_2.grid(row=8, column=2, padx=15)
 
-        self.sliderLabel = tk.Label(self)
-        self.sliderLabel.configure(background=self.backgroundcolour)
-        self.sliderLabel.grid(column=1, row=5,sticky="nwe")
-        self.sliderLabel['text'] = 'Similarity Cutoff'
+        self.label_similarity = tk.Label(self)
+        self.label_similarity.configure(background=self.backgroundcolour)
+        self.label_similarity.grid(column=1, row=5,sticky="nwe")
+        self.label_similarity['text'] = 'Similarity Cutoff'
 
-        self.sliderLabel = tk.Label(self)
-        self.sliderLabel.configure(background=self.backgroundcolour)
-        self.sliderLabel.grid(column=1, row=7,sticky="nwe")
-        self.sliderLabel['text'] = 'Maximum Matches to return'
+        self.label_slider = tk.Label(self)
+        self.label_slider.configure(background=self.backgroundcolour)
+        self.label_slider.grid(column=1, row=7,sticky="nwe")
+        self.label_slider['text'] = 'Maximum Matches to return'
+
+        self.combobox_matchTypeSelector = ttk.Combobox(self, textvariable=self.matchingMode, width=20)
+        self.combobox_matchTypeSelector['values'] = self.matchingOptions
+        self.combobox_matchTypeSelector.state(['readonly'])
+        self.combobox_matchTypeSelector.bind('<<ComboboxSelected>>', self.toggleFuzzyWidgets)
+        self.combobox_matchTypeSelector.grid(row=10, column=1, pady=5)
 
         #self.matchCountVar.set(f'Rows Matched: {matchCount}')
-        self.matchedCountLabel = tk.Label(self, textvariable=matchCountText)
-        self.matchedCountLabel.configure(background=self.backgroundcolour, font='TkDefaultFont 10 bold')
-        self.matchedCountLabel.grid(column=0, row=10,sticky="nw", padx=15)
+        self.label_matchedCount = tk.Label(self, textvariable=matchCountText)
+        self.label_matchedCount.configure(background=self.backgroundcolour, font='TkDefaultFont 10 bold')
+        self.label_matchedCount.grid(column=0, row=10,sticky="nw", padx=15)
         
 
-        fuzzyHeader = tk.Label(self, text="Fuzzy Matching Options", font="Arial 12 bold")
-        fuzzyHeader.configure(background=self.backgroundcolour)
-        fuzzyHeader.grid(column=1, row=1, pady=10)
+        header_fuzzy = tk.Label(self, text="Fuzzy Matching Options", font="Arial 12 bold")
+        header_fuzzy.configure(background=self.backgroundcolour)
+        header_fuzzy.grid(column=1, row=1, pady=10)
 
         # Decider widgets
-        decideHeader = tk.Label(self, text="Self Deciding Match Options", font="Arial 12 bold")
-        decideHeader.configure(background=self.backgroundcolour)
-        decideHeader.grid(column=1, row=11, pady=10)
+        header_decide = tk.Label(self, text="Self Deciding Match Options", font="Arial 12 bold")
+        header_decide.configure(background=self.backgroundcolour)
+        header_decide.grid(column=1, row=11, pady=10)
 
-        self.runSDfuncsBox = tk.Checkbutton(self, text='Apply Smart Matching Decisions To Results', font="Arial 10 bold", variable=self.doSmartMatch, onvalue=True, offvalue=False, command=self.unlockSelfDecideWidgets, cursor='hand2')
-        self.runSDfuncsBox.configure(background=self.backgroundcolour)
-        self.runSDfuncsBox.grid(column=1, row=12, pady=5)
+        self.checkbutton_runSDFuncs = tk.Checkbutton(self, text='Apply Smart Matching Decisions To Results', font="Arial 10 bold", variable=self.doSmartMatch, onvalue=True, offvalue=False, command=self.unlockSelfDecideWidgets, cursor='hand2')
+        self.checkbutton_runSDFuncs.configure(background=self.backgroundcolour)
+        self.checkbutton_runSDFuncs.grid(column=1, row=12, pady=5)
 
         self.sd_slider = {"Parameter 1":[], "Parameter 2":[], "Parameter 3":[]}
-        self.sd_listBox = {"Parameter 1":[], "Parameter 2":[], "Parameter 3":[]}
+        self.sd_combobox = {"Parameter 1":[], "Parameter 2":[], "Parameter 3":[]}
         self.sd_compareEmpty = {"Parameter 1":[], "Parameter 2":[], "Parameter 3":[]}
 
         c=0
@@ -817,24 +905,27 @@ class MainPage(tk.Frame):
             self.sd_slider[key][1].grid(column=c, row=13)
             c += 1
         c=0
-        for key in self.sd_listBox:
-            self.sd_listBox[key].append(tk.Listbox(self, width=30, height=5, selectmode="single", exportselection=0))
-            self.sd_listBox[key][0].grid(column=c, row=16, rowspan=4, pady=5)
-            self.sd_listBox[key][0].bind('<<ListboxSelect>>', self.checkToEnableRun)
-            self.sd_listBox[key].append(tk.Label(self, text=key, font=("Boulder", 13)))
-            self.sd_listBox[key].append(tk.Listbox(self, width=30, height=5, selectmode="single", exportselection=0))
-            self.sd_listBox[key][2].grid(column=c, row=21, rowspan=4, pady=5)
-            self.sd_listBox[key][2].bind('<<ListboxSelect>>', self.checkToEnableRun)
+
+        for key in self.sd_combobox:
+            self.sd_combobox[key].append(ttk.Combobox(self, width=30))
+            self.sd_combobox[key][0].grid(column=c, row=16, pady=5)
+            self.sd_combobox[key][0].bind('<<ComboboxSelected>>', self.checkToEnableRun)
+            self.sd_combobox[key][0].state(["readonly"])
+            self.sd_combobox[key].append(tk.Label(self, text=key, font=("Boulder", 13)))
+            self.sd_combobox[key].append(ttk.Combobox(self, width=30))
+            self.sd_combobox[key][2].grid(column=c, row=21, pady=5)
+            self.sd_combobox[key][2].bind('<<ComboboxSelected>>', self.checkToEnableRun)
+            self.sd_combobox[key][2].state(["readonly"])
             c += 1
         c=0
         for key in self.sd_compareEmpty:
             self.sd_compareEmpty[key].append(tk.BooleanVar(value=False))
-            self.sd_compareEmpty[key].append(tk.Checkbutton(self, text="Ignore match if both blank", variable=self.sd_compareEmpty[key][0], onvalue=True, offvalue=False, cursor='hand2'))
+            self.sd_compareEmpty[key].append(tk.Checkbutton(self, text="Ignore matching blank values", variable=self.sd_compareEmpty[key][0], onvalue=True, offvalue=False, cursor='hand2'))
             self.sd_compareEmpty[key][1].grid(column=c, row=15)
             self.sd_compareEmpty[key][1].configure(background=self.backgroundcolour)
             c += 1
 
-        self.changeWidgetCollectionState(self.sd_listBox, 'disabled')
+        self.changeWidgetCollectionState(self.sd_combobox, 'disabled')
         self.changeWidgetCollectionState(self.sd_slider, 'disabled')
         self.changeWidgetCollectionState(self.sd_compareEmpty, 'disabled')
 
@@ -842,7 +933,6 @@ class MainPage(tk.Frame):
         self.info.configure(bg=self.backgroundcolour)
         self.info.grid(column=0, row=26, pady=10, padx=15, columnspan=3, sticky='ew')
         sys.stdout = TextRedirector(self.info, "stdout")
-        self.info['state'] = 'disabled'
         self.info.see('end')
         
 
