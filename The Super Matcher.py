@@ -343,14 +343,15 @@ def fuzzyMatch(tabledata:list, column_selection:list, similarity_threshold:int, 
     matchedCounter = 0
     print('Beginning Fuzzy Matching...\n')
 
-    combinedTable = pd.DataFrame(columns=[*left_table.columns.values, *right_table.columns.values, 'Similarity Score'])
-    
+    combinedTable_rows = []
+
     for index, val in left_table.iterrows():
         leftVal = val[matchOnLeft]
         rightVal = right_table[matchOnRight]
-        returnedValues = process.extract(val[matchOnLeft], right_table[matchOnRight], scorer=scorer, limit=matchLimit)
+        returnedValues = process.extract(leftVal, rightVal, scorer=scorer, limit=matchLimit)
         filteredValues = []
         skippedPairs = 0
+        
         for pair in returnedValues:
             if pair[1] >= similarity_threshold or len(returnedValues) - skippedPairs == 1:
                 filteredValues.append(pair)
@@ -358,20 +359,28 @@ def fuzzyMatch(tabledata:list, column_selection:list, similarity_threshold:int, 
                 skippedPairs += 1
 
         for pair in filteredValues:
+            # No matches found for a row but still output no matches
             if len(filteredValues) == 1 and pair[1] < similarity_threshold:
                 pair = ("", 0)
-                combinedrow = left_table.iloc[index]
+
+                combinedrow = val.copy()
                 combinedrow['Similarity Score'] = pair[1]
-                combinedTable = combinedTable.append(combinedrow, ignore_index=True) # NOTE using pd.append() is depreciated
-            else:
-                row_from_left = left_table.iloc[index]
-                row_from_right = right_table.iloc[pair[2]]
+                combinedTable_rows.append(combinedrow)
+            else: # Matches found to add to results
+                row_from_left = val.copy()
+                row_from_right = right_table.iloc[pair[2]].copy()
+
                 combinedrow = pd.concat([row_from_left, row_from_right])
                 combinedrow['Similarity Score'] = pair[1]
-                combinedTable = combinedTable.append(combinedrow, ignore_index=True) # NOTE using pd.append() is depreciated
+                combinedTable_rows.append(combinedrow)
                 matchedCounter += 1
+
         matchCountText.set(f'Row Matches Found: {matchedCounter} | Row: {index+1}/{left_table_len}')
+
     print(f"Fuzzy Matching Complete, {matchedCounter} matches found.\n")
+
+    # Concatenate all rows at once into a DataFrame
+    combinedTable = pd.concat(combinedTable_rows, axis=1).T.reset_index(drop=True)
     return combinedTable
 
 def keywordMatch(tabledata:list, colSelection:list) -> pd.DataFrame:
@@ -540,7 +549,7 @@ class MainPage(tk.Frame):
         self.selectedcol2 = tk.StringVar()
         self.doSmartMatch = tk.BooleanVar(value=False)
         self.matchCountVar = tk.StringVar()
-        self.matchingOptions = ["Match Cell Contents", "Keyword Search"]
+        self.matchingOptions = ["Fuzzy Match", "Keyword Search"]
         self.matchingMode = tk.StringVar(value=self.matchingOptions[0])
         self.unselectedParameter = '---Select---'
         global matchCountText
@@ -957,7 +966,7 @@ class MainPage(tk.Frame):
         self.label_matchedCount.grid(column=0, row=10,sticky="nw", padx=15)
         
 
-        header_fuzzy = tk.Label(self, text="Fuzzy Matching Options", font="Arial 12 bold")
+        header_fuzzy = tk.Label(self, text="Matching Options", font="Arial 12 bold")
         header_fuzzy.configure(background=self.backgroundcolour)
         header_fuzzy.grid(column=1, row=1, pady=10)
 
